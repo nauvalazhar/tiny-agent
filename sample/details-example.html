@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Details Tag Examples</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        details {
+            margin: 20px 0;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        summary {
+            font-weight: bold;
+            cursor: pointer;
+            padding: 5px;
+            background-color: #f5f5f5;
+            border-radius: 3px;
+        }
+        summary:hover {
+            background-color: #ebebeb;
+        }
+        .content {
+            padding: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>HTML Details Tag Examples</h1>
+    <p>The details tag creates collapsible content sections. Click on the summaries to expand/collapse them.</p>
+
+    <!-- Basic Example -->
+    <details>
+        <summary>What is the details tag?</summary>
+        <div class="content">
+            <p>The details tag is an HTML element that creates a disclosure widget where information is visible only when toggled open. It's commonly used for FAQ sections, expandable content, and progressive disclosure.</p>
+        </div>
+    </details>
+
+    <!-- Example with rich content -->
+    <details>
+        <summary>Features of the details tag</summary>
+        <div class="content">
+            <ul>
+                <li>Native browser support (no JavaScript required)</li>
+                <li>Accessible by default</li>
+                <li>Can contain any HTML content</li>
+                <li>Keyboard navigable</li>
+                <li>SEO friendly</li>
+            </ul>
+        </div>
+    </details>
+
+    <!-- Pre-opened example -->
+    <details open>
+        <summary>This section is open by default</summary>
+        <div class="content">
+            <p>You can use the "open" attribute to make a details element expanded by default. This is useful when you want to show important content initially but still allow users to collapse it.</p>
+        </div>
+    </details>
+
+    <!-- Nested example -->
+    <details>
+        <summary>Advanced usage</summary>
+        <div class="content">
+            <p>Details tags can be nested and contain complex content:</p>
+            
+            <details>
+                <summary>Browser support</summary>
+                <div class="content">
+                    <p>Supported in all modern browsers including Chrome, Firefox, Safari, and Edge.</p>
+                </div>
+            </details>
+
+            <details>
+                <summary>Styling options</summary>
+                <div class="content">
+                    <p>You can style the summary element and the content inside details with CSS. The marker can also be customized.</p>
+                </div>
+            </details>
+        </div>
+    </details>
+
+    <!-- Code example -->
+    <details>
+        <summary>Basic HTML structure</summary>
+        <div class="content">
+            <p>Here's the basic structure:</p>
+            <pre><code>&lt;details&gt;
+    &lt;summary&gt;Click to expand&lt;/summary&gt;
+    &lt;p&gt;This content is hidden until expanded.&lt;/p&gt;
+&lt;/details&gt;</code></pre>
+        </div>
+    </details>
+
+</body>
+</html>

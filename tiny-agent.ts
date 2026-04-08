@@ -45,6 +45,12 @@ const OUTPUT_PROMPT = `# Output format
 const SYSTEM_PROMPT = `You are a coding assistant that helps users with software engineering tasks. You have access to tools for reading, searching,
   editing files, and running commands.
 
+  # Tool efficiency
+
+  - When you need to run multiple independent tool calls, make them IN PARALLEL in a single response.
+  - For example, if you need to read 3 files, call read_file 3 times in one message, not across 3 turns.
+  - This is much faster for the user. Only use sequential calls when one tool's result is needed to decide the next call.
+
   # How to work
 
   - When given a task, start by understanding the codebase. Use list_files and search_files to find relevant files before making changes.
@@ -120,8 +126,15 @@ type Tool<T extends z.ZodObject<any> = z.ZodObject<any>> = {
   description: string;
   inputSchema: T;
   isInteractive?: boolean;
+  isConcurrencySafe?: boolean;
   call(input: z.infer<T>, session: Session): Promise<string>;
   checkPermissions(input: z.infer<T>): PermissionDecision;
+};
+
+type ApprovedCall = {
+  block: Anthropic.ToolUseBlockParam;
+  tool: Tool;
+  parsedInput: any;
 };
 
 type Session = {
@@ -388,6 +401,7 @@ const getTimeTool: Tool = createTool({
   name: "get_time",
   description: "Get the current time",
   inputSchema: z.object({}),
+  isConcurrencySafe: true,
   async call() {
     return new Date().toString();
   },
@@ -402,6 +416,7 @@ const readFileTool: Tool = createTool({
   inputSchema: z.object({
     file_path: z.string().describe("The path to the file to read"),
   }),
+  isConcurrencySafe: true,
   async call(input, session) {
     const { file_path } = input;
     try {
@@ -532,6 +547,7 @@ const globTool: Tool = createTool({
       .optional()
       .describe("The glob pattern to match files. Defaults to '**/*'"),
   }),
+  isConcurrencySafe: true,
   async call(input) {
     const { directory = process.cwd(), pattern = "**/*" } = input;
 
@@ -582,6 +598,7 @@ const grepTool: Tool = createTool({
       .describe("The directory to search. Defaults to current directory."),
     pattern: z.string().describe("The pattern to search for"),
   }),
+  isConcurrencySafe: true,
   async call(input) {
     const { directory = process.cwd(), pattern } = input;
 
@@ -808,6 +825,7 @@ const webSearchTool: Tool = createTool({
   inputSchema: z.object({
     query: z.string().describe("The search query"),
   }),
+  isConcurrencySafe: true,
   async call(input) {
     const { query } = input;
 
@@ -862,6 +880,7 @@ const webFetchTool: Tool = createTool({
         "What you want to know or extract from the page (e.g. 'the installation instructions')",
       ),
   }),
+  isConcurrencySafe: true,
   async call(input) {
     const { url, prompt } = input;
     const cacheKey = `${url}::${prompt}`;
@@ -1016,6 +1035,9 @@ async function streamResponse(
             });
           }
           currentToolInput = "";
+
+          // you can execute the tool here during mid-stream
+          // but it's different story
         }
         currentBlockType = null;
         break;
@@ -1025,6 +1047,48 @@ async function streamResponse(
   if (didWrite) process.stdout.write("\n");
 
   return contentBlocks;
+}
+
+/**
+ * Tool executor
+ */
+
+async function executeToolCall<T extends z.ZodObject<any>>(
+  toolUseBlock: Anthropic.ToolUseBlockParam,
+  tool: Tool<T>,
+  inputParsed: z.infer<T>,
+  session: Session,
+  silent: boolean,
+): Promise<Anthropic.ToolResultBlockParam> {
+  try {
+    const toolResultRaw = await tool.call(inputParsed, session);
+    const toolResult = truncateResult(toolResultRaw);
+
+    if (!silent) {
+      logger.dim(
+        `  → ${tool.name}:\n${toolResult.slice(0, 100)}${toolResult.length > 100 ? "..." : ""}`,
+      );
+    }
+
+    return {
+      type: "tool_result",
+      tool_use_id: toolUseBlock.id,
+      content: toolResult,
+    };
+  } catch (error) {
+    if (!silent) {
+      logger.error(
+        `Error executing ${toolUseBlock.name}: ${(error as Error).message}`,
+      );
+    }
+
+    return {
+      type: "tool_result",
+      tool_use_id: toolUseBlock.id,
+      content: `Error executing tool ${tool.name}: ${(error as Error).message}`,
+      is_error: true,
+    };
+  }
 }
 
 /**
@@ -1039,7 +1103,7 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
     maxTurns = MAX_TURNS,
     tools: availableTools,
     label,
-    silent,
+    silent = false,
   } = config;
 
   const spinner = session.spinner;
@@ -1112,40 +1176,48 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
 
     // Execute tools
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
+    const approvedCalls: ApprovedCall[] = [];
+    const deniedResults: Anthropic.ToolResultBlockParam[] = [];
 
     for (const toolUseBlock of toolUseBlocks) {
-      const tool = tools.find((t) => t.name === toolUseBlock.name);
+      const tool = availableTools.find((t) => t.name === toolUseBlock.name);
 
       if (!tool) {
-        toolResults.push({
+        if (!silent) {
+          logger.error(`Tool not found: ${toolUseBlock.name}`);
+        }
+
+        deniedResults.push({
           type: "tool_result",
           tool_use_id: toolUseBlock.id,
           content: `Tool not found: ${toolUseBlock.name}`,
           is_error: true,
         });
-        logger.error("Tool not found: " + toolUseBlock.name);
         continue;
       }
 
       const toolInputParse = tool.inputSchema.safeParse(toolUseBlock.input);
 
       if (!toolInputParse.success) {
-        toolResults.push({
+        if (!silent) {
+          logger.error(
+            `Invalid input for tool ${toolUseBlock.name}: ${toolInputParse.error.message}`,
+          );
+        }
+
+        deniedResults.push({
           type: "tool_result",
           tool_use_id: toolUseBlock.id,
-          content: `Invalid input for tool ${tool.name}: ${toolInputParse.error.message}`,
+          content: `Invalid input for tool ${toolUseBlock.name}: ${toolInputParse.error.message}`,
           is_error: true,
         });
-        logger.error(
-          `Invalid input for ${toolUseBlock.name}: ${toolInputParse.error.message}`,
-        );
         continue;
       }
 
       const decision = getDecision(tool, toolInputParse.data, session);
 
       if (decision === "deny") {
-        toolResults.push({
+        deniedResults.push({
           type: "tool_result",
           tool_use_id: toolUseBlock.id,
           content: "Permission denied.",
@@ -1162,7 +1234,7 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
         );
 
         if (!allowed) {
-          toolResults.push({
+          deniedResults.push({
             type: "tool_result",
             tool_use_id: toolUseBlock.id,
             content: "Permission denied by user",
@@ -1172,38 +1244,84 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
         }
       }
 
-      if (!silent && !tool.isInteractive)
-        spinner.start(`Running ${tool.name}...`);
+      approvedCalls.push({
+        block: toolUseBlock,
+        tool,
+        parsedInput: toolInputParse.data,
+      });
+    }
 
-      try {
-        const toolResultRaw = await tool.call(toolInputParse.data, session);
-        const toolResult = truncateResult(toolResultRaw);
+    const safeCalls: ApprovedCall[] = [];
+    const unsafeCalls: ApprovedCall[] = [];
 
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: toolUseBlock.id,
-          content: toolResult,
-        });
-
-        if (!silent) {
-          spinner.stop();
-          logger.dim(
-            `  → ${tool.name}:\n${toolResult.slice(0, 100)}${toolResult.length > 100 ? "..." : ""}`,
-          );
-        }
-      } catch (error) {
-        if (!silent) spinner.stop();
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: toolUseBlock.id,
-          content: `Error executing tool ${tool.name}: ${(error as Error).message}`,
-          is_error: true,
-        });
-        logger.error(
-          `Error executing ${toolUseBlock.name}: ${(error as Error).message}`,
-        );
-        continue;
+    for (const call of approvedCalls) {
+      if (call.tool.isConcurrencySafe) {
+        safeCalls.push(call);
+      } else {
+        unsafeCalls.push(call);
       }
+    }
+
+    /**
+     * Execute concurrency safe tools in parallel
+     */
+
+    if (!silent && safeCalls.length > 0) {
+      spinner.start(
+        safeCalls.length === 1
+          ? `Running ${safeCalls[0].tool.name}...`
+          : `Running ${safeCalls.length} tools in parallel...`,
+      );
+    }
+
+    const safeResults = await Promise.all(
+      safeCalls.map(({ block, tool, parsedInput }) =>
+        executeToolCall(block, tool, parsedInput, session, silent),
+      ),
+    );
+
+    if (!silent && safeCalls.length > 0) {
+      spinner.stop();
+    }
+
+    /**
+     * Execute concurrency unsafe tools sequential
+     */
+
+    const unsafeResults: Anthropic.ToolResultBlockParam[] = [];
+
+    for (const { block, tool, parsedInput } of unsafeCalls) {
+      if (!silent && !tool.isInteractive) {
+        spinner.start(`Running ${tool.name}...`);
+      }
+
+      const result = await executeToolCall(
+        block,
+        tool,
+        parsedInput,
+        session,
+        silent,
+      );
+
+      unsafeResults.push(result);
+
+      if (!silent && !tool.isInteractive) {
+        spinner.stop();
+      }
+    }
+
+    /**
+     * You can do this too for some models:
+     * [...deniedResults, ...safeResults, ...unsafeResults]
+     */
+    const resultById = new Map<string, Anthropic.ToolResultBlockParam>();
+    for (const r of deniedResults) resultById.set(r.tool_use_id, r);
+    for (const r of safeResults) resultById.set(r.tool_use_id, r);
+    for (const r of unsafeResults) resultById.set(r.tool_use_id, r);
+
+    for (const toolUseBlock of toolUseBlocks) {
+      const result = resultById.get(toolUseBlock.id);
+      if (result) toolResults.push(result);
     }
 
     conversation.push({
@@ -1295,12 +1413,3 @@ async function main() {
 }
 
 main();
-
-/**
- * Missing
- * [ ] Paralel tool calls
- * [x] Subagents
- * [x] Web search and fetch
- * [ ] Persistent and clear session
- * [x] Plan mode
- */
