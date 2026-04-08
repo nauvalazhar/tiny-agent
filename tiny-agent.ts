@@ -3,16 +3,19 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Stream } from "@anthropic-ai/sdk/streaming";
 import { input, select } from "@inquirer/prompts";
-import fg from "fast-glob";
+import { randomUUID } from "crypto";
+import fg, { stream } from "fast-glob";
+import { createReadStream } from "fs";
 import fs from "fs/promises";
+import { LRUCache } from "lru-cache";
 import ora from "ora";
-import { platform } from "os";
+import { homedir, platform } from "os";
 import path from "path";
 import pc from "picocolors";
 import { RE2 } from "re2-wasm";
-import z from "zod";
+import { createInterface } from "readline";
 import TurndownService from "turndown";
-import { LRUCache } from "lru-cache";
+import z from "zod";
 
 const client = new Anthropic();
 const turndown = new TurndownService();
@@ -32,6 +35,8 @@ const MAX_CONTENT_LENGTH = 100_000;
 const WEB_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min
 const WEB_CACHE_MAX_ENTRIES = 100;
 const WEB_CACHE_MAX_SIZE_BYTES = 50 * 1024 * 1024; // 50 mb
+const CONFIG_DIR = path.join(homedir(), ".tiny-agent");
+const PROJECTS_DIR = path.join(CONFIG_DIR, "projects");
 
 const OUTPUT_PROMPT = `# Output format
 
@@ -142,6 +147,8 @@ type Session = {
   readTimestamps: Map<string, number>;
   spinner: ReturnType<typeof ora>;
   planMode: boolean;
+  sessionId: string;
+  sessionPath: string;
 };
 
 type AgentLoopConfig = {
@@ -152,6 +159,13 @@ type AgentLoopConfig = {
   label: string;
   maxTurns?: number;
   silent?: boolean;
+};
+
+type TranscriptEntry = {
+  type: "user" | "assistant";
+  timestamp: string;
+  cwd: string;
+  message: Anthropic.MessageParam;
 };
 
 /**
@@ -166,11 +180,16 @@ const webFetchCache = new LRUCache<string, string>({
 });
 
 function createSession(): Session {
+  const sessionId = randomUUID();
+  const sessionPath = path.join(getProjectDir(), `${sessionId}.jsonl`);
+
   return {
     allowedTools: new Set(),
     readTimestamps: new Map(),
     spinner: ora({ text: "Cooking...", color: "green" }),
     planMode: false,
+    sessionId,
+    sessionPath,
   };
 }
 
@@ -191,6 +210,24 @@ const logger = {
 /**
  * Helper functions
  */
+
+function sanitizeCwd(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "");
+}
+
+function getProjectDir() {
+  return path.join(PROJECTS_DIR, sanitizeCwd(process.cwd()));
+}
+
+async function appendSessionEntry(
+  sessionPath: string,
+  entry: TranscriptEntry,
+): Promise<void> {
+  await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+
+  const line = JSON.stringify(entry) + "\n";
+  await fs.appendFile(sessionPath, line, "utf-8");
+}
 
 function normalizeQuotes(str: string): string {
   return str
@@ -389,6 +426,91 @@ async function askUserPermission(
   }
 
   return choice === "yes";
+}
+
+async function getSessionLabel(filePath: string): Promise<string> {
+  try {
+    const fileStream = createReadStream(filePath, { encoding: "utf-8" });
+    const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      if (!line) continue;
+
+      try {
+        const entry = JSON.parse(line) as TranscriptEntry;
+
+        if (
+          entry.type === "user" &&
+          typeof entry.message.content === "string"
+        ) {
+          const text = entry.message.content.slice(0, 60);
+          rl.close();
+          fileStream.destroy();
+          return text + (entry.message.content.length > 60 ? "..." : "");
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return "(empty)";
+  } catch {
+    return "(unreadable)";
+  }
+}
+
+async function listSessions(): Promise<
+  {
+    id: string;
+    path: string;
+    mtime: Date;
+    label: string;
+  }[]
+> {
+  const dir = getProjectDir();
+
+  try {
+    const files = await fs.readdir(dir);
+    const sessions = await Promise.all(
+      files
+        .filter((file) => file.endsWith(".jsonl"))
+        .map(async (file) => {
+          const filePath = path.join(dir, file);
+          const stat = await fs.stat(filePath);
+          const label = await getSessionLabel(filePath);
+
+          return {
+            id: file.replace(".jsonl", ""),
+            path: filePath,
+            mtime: stat.mtime,
+            label,
+          };
+        }),
+    );
+
+    return sessions.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+  } catch {
+    return [];
+  }
+}
+
+async function loadSession(
+  filePath: string,
+): Promise<Anthropic.MessageParam[]> {
+  const content = await fs.readFile(filePath, "utf-8");
+  const lines = content.split("\n").filter((line) => line.length > 0);
+
+  const messages: Anthropic.MessageParam[] = [];
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line) as TranscriptEntry;
+      messages.push(entry.message);
+    } catch {
+      // skip if error
+    }
+  }
+
+  return messages;
 }
 
 /**
@@ -1143,7 +1265,7 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
       max_tokens: 4096,
       messages: compactedConversation,
       tools: toolsJson,
-      system: systemPrompt,
+      system: `${systemPrompt}\n\nToday's date is ${new Date().toISOString().split("T")[0]}`,
       stream: true,
     });
 
@@ -1161,6 +1283,16 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
     conversation.push({
       role: "assistant",
       content: contentBlocks,
+    });
+
+    await appendSessionEntry(session.sessionPath, {
+      type: "assistant",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+      message: {
+        role: "assistant",
+        content: contentBlocks,
+      },
     });
 
     const toolUseBlocks = contentBlocks.filter(
@@ -1329,6 +1461,16 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
       content: toolResults,
     });
 
+    await appendSessionEntry(session.sessionPath, {
+      type: "user",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+      message: {
+        role: "user",
+        content: toolResults,
+      },
+    });
+
     turns++;
   }
 }
@@ -1379,10 +1521,49 @@ async function main() {
               : "Plan mode disabled.",
           );
           continue; // skip agent loop, go back to prompt
+        case "/resume":
+          const sessions = await listSessions();
+
+          if (sessions.length === 0) {
+            logger.warn("No previous sessions found for this directory.");
+          }
+
+          let choice: string;
+          try {
+            choice = await select({
+              message: "Resume which session?",
+              choices: sessions.slice(0, 10).map((session) => ({
+                name: `${session.label} - ${session.mtime.toLocaleString()}`,
+                value: session.path,
+              })),
+            });
+          } catch {
+            logger.dim("Resume cancelled");
+            continue;
+          }
+
+          const loadedSession = await loadSession(choice);
+          conversation.length = 0;
+          conversation.push(...loadedSession);
+
+          session.sessionPath = choice;
+
+          logger.info(`Resumed ${loadedSession.length} messages.`);
+
+          continue;
         case "/clear":
           conversation.length = 0;
+
+          const newSessionId = randomUUID();
+          session.sessionId = newSessionId;
+          session.sessionPath = path.join(
+            getProjectDir(),
+            `${newSessionId}.jsonl`,
+          );
+
           console.clear();
           logger.dim("Conversation cleared.");
+          console.log();
           continue;
         default:
           logger.warn(`Unknown command: ${cmd}`);
@@ -1391,6 +1572,16 @@ async function main() {
     }
 
     conversation.push({ role: "user", content: message });
+
+    await appendSessionEntry(session.sessionPath, {
+      type: "user",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+      message: {
+        role: "user",
+        content: message,
+      },
+    });
 
     try {
       const finalSystemPrompt = session.planMode
