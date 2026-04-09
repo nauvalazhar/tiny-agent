@@ -102,6 +102,18 @@ const PLAN_MODE_INSTRUCTION = `
  * Type definitions
  */
 
+type ClassifiedError = {
+  kind:
+    | "auth"
+    | "permission"
+    | "rate_limit"
+    | "overloaded"
+    | "context_length"
+    | "network"
+    | "unknown";
+  message: string;
+};
+
 type Config = {
   apiKey?: string;
 };
@@ -202,6 +214,60 @@ const logger = {
  * Helper functions
  */
 
+function classifyError(error: any): ClassifiedError {
+  if (error?.status === 401) {
+    return {
+      kind: "auth",
+      message: "Invalid API key. Run /login to update it.",
+    };
+  }
+  if (error?.status === 403) {
+    return {
+      kind: "permission",
+      message: "API key lacks permission for this model.",
+    };
+  }
+  if (error?.status === 429) {
+    return {
+      kind: "rate_limit",
+      message: "Rate limited. Please wait a moment and try again.",
+    };
+  }
+  if (error?.status === 529) {
+    return {
+      kind: "overloaded",
+      message: "Anthropic API is overloaded. Try again shortly.",
+    };
+  }
+  if (
+    error?.status === 400 &&
+    typeof error?.message === "string" &&
+    (error.message.includes("prompt is too long") ||
+      error.message.includes("context_length"))
+  ) {
+    return {
+      kind: "context_length",
+      message:
+        "Conversation is too long. Run /clear to start fresh, or /tokens to check size.",
+    };
+  }
+  if (
+    error?.code === "ENOTFOUND" ||
+    error?.code === "ECONNREFUSED" ||
+    error?.code === "ETIMEDOUT" ||
+    error?.code === "ECONNRESET"
+  ) {
+    return {
+      kind: "network",
+      message: "Network error. Check your internet connection.",
+    };
+  }
+  return {
+    kind: "unknown",
+    message: error?.message ?? String(error),
+  };
+}
+
 async function loadConfig(): Promise<Config> {
   try {
     const content = await fs.readFile(CONFIG_FILE, "utf-8");
@@ -240,22 +306,16 @@ async function validateApiKey(
     });
     return { valid: true };
   } catch (error: any) {
-    if (error.status === 401) {
-      return { valid: false, reason: "Invalid API key" };
-    }
-    if (error.status === 403) {
-      return { valid: false, reason: "Key has no permission for this model" };
-    }
-    if (error.status === 429) {
+    const classifiedError = classifyError(error);
+
+    if (classifiedError.kind === "rate_limit") {
       return {
         valid: false,
         reason: "Rate limited (key is valid but throttled)",
       };
     }
-    if (error.code === "ENOTFOUND" || error.code === "ECONNREFUSED") {
-      return { valid: false, reason: "Network error — check your connection" };
-    }
-    return { valid: false, reason: error.message ?? "Unknown error" };
+
+    return { valid: false, reason: classifiedError.message };
   }
 }
 
@@ -286,13 +346,17 @@ async function appendSessionEntry(
   sessionPath: string,
   entry: TranscriptEntry,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(sessionPath), { recursive: true, mode: 0o700 });
+  try {
+    await fs.mkdir(path.dirname(sessionPath), { recursive: true, mode: 0o700 });
 
-  const line = JSON.stringify(entry) + "\n";
-  await fs.appendFile(sessionPath, line, {
-    encoding: "utf-8",
-    mode: 0o600,
-  });
+    const line = JSON.stringify(entry) + "\n";
+    await fs.appendFile(sessionPath, line, {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+  } catch (error) {
+    logger.warn(`Failed to persist session: ${(error as Error).message}`);
+  }
 }
 
 async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
@@ -425,36 +489,48 @@ async function compactConversation(
     };
   }
 
-  const summaryResponse = await session.client.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 1024,
-    system: COMPACT_SYSTEM_PROMPT,
-    messages: conversation,
-  });
+  try {
+    const summaryResponse = await session.client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1024,
+      system: COMPACT_SYSTEM_PROMPT,
+      messages: conversation,
+    });
 
-  const summaryText = summaryResponse.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
+    const summaryText = summaryResponse.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
 
-  const recentMessages = conversation.slice(-KEEP_RECENT_MESSAGES);
+    const recentMessages = conversation.slice(-KEEP_RECENT_MESSAGES);
 
-  const compacted: Anthropic.MessageParam[] = [
-    {
-      role: "user",
-      content: `[conversation summary]\n${summaryText}\n\n[continuing from here]\n`,
-    },
-    {
-      role: "assistant",
-      content: "Understood. I have the context from our previous conversation.",
-    },
-    ...recentMessages,
-  ];
+    const compacted: Anthropic.MessageParam[] = [
+      {
+        role: "user",
+        content: `[conversation summary]\n${summaryText}\n\n[continuing from here]\n`,
+      },
+      {
+        role: "assistant",
+        content:
+          "Understood. I have the context from our previous conversation.",
+      },
+      ...recentMessages,
+    ];
 
-  return {
-    conversation: compacted,
-    wasCompacted: true,
-  };
+    return {
+      conversation: compacted,
+      wasCompacted: true,
+    };
+  } catch (error) {
+    logger.warn(
+      `Compaction failed (${(error as Error).message}). Dropping old messages instead.`,
+    );
+
+    return {
+      conversation: conversation.slice(-KEEP_RECENT_MESSAGES * 2),
+      wasCompacted: true,
+    };
+  }
 }
 
 function getDecision<T extends z.ZodObject<any>>(
@@ -577,20 +653,31 @@ async function listSessions(): Promise<
 async function loadSession(
   filePath: string,
 ): Promise<Anthropic.MessageParam[]> {
-  const content = await fs.readFile(filePath, "utf-8");
-  const lines = content.split("\n").filter((line) => line.length > 0);
+  try {
+    const content = await fs.readFile(filePath, "utf-8");
+    const lines = content.split("\n").filter((line) => line.length > 0);
 
-  const messages: Anthropic.MessageParam[] = [];
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line) as TranscriptEntry;
-      messages.push(entry.message);
-    } catch {
-      // skip if error
+    const messages: Anthropic.MessageParam[] = [];
+    let skipped = 0;
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line) as TranscriptEntry;
+        messages.push(entry.message);
+      } catch {
+        skipped++;
+      }
     }
-  }
 
-  return messages;
+    if (skipped > 0) {
+      logger.warn(`Skipped ${skipped} malformed entries in session file`);
+    }
+
+    return messages;
+  } catch (error) {
+    logger.error(`Failed to load session: ${(error as Error).message}`);
+    return [];
+  }
 }
 
 function formatUsage(usage: Anthropic.Usage): string {
@@ -1259,91 +1346,100 @@ async function streamResponse(
   let currentToolName = "";
   let currentTextIndex = -1;
 
-  for await (const event of response) {
-    switch (event.type) {
-      case "message_start":
-        if (event.message.usage) {
-          usage = {
-            ...event.message.usage,
-          };
-        }
-        break;
+  try {
+    for await (const event of response) {
+      switch (event.type) {
+        case "message_start":
+          if (event.message.usage) {
+            usage = {
+              ...event.message.usage,
+            };
+          }
+          break;
 
-      case "message_delta":
-        if (event.usage && usage) {
-          if (typeof event.usage.output_tokens === "number") {
-            usage.output_tokens = event.usage.output_tokens;
+        case "message_delta":
+          if (event.usage && usage) {
+            if (typeof event.usage.output_tokens === "number") {
+              usage.output_tokens = event.usage.output_tokens;
+            }
+            if (typeof event.usage.input_tokens === "number") {
+              usage.input_tokens = event.usage.input_tokens;
+            }
+            if (typeof event.usage.cache_read_input_tokens === "number") {
+              usage.cache_read_input_tokens =
+                event.usage.cache_read_input_tokens;
+            }
+            if (typeof event.usage.cache_creation_input_tokens === "number") {
+              usage.cache_creation_input_tokens =
+                event.usage.cache_creation_input_tokens;
+            }
           }
-          if (typeof event.usage.input_tokens === "number") {
-            usage.input_tokens = event.usage.input_tokens;
-          }
-          if (typeof event.usage.cache_read_input_tokens === "number") {
-            usage.cache_read_input_tokens = event.usage.cache_read_input_tokens;
-          }
-          if (typeof event.usage.cache_creation_input_tokens === "number") {
-            usage.cache_creation_input_tokens =
-              event.usage.cache_creation_input_tokens;
-          }
-        }
-        break;
+          break;
 
-      case "content_block_start":
-        if (event.content_block.type === "text") {
-          currentBlockType = "text";
-          currentTextIndex = contentBlocks.length;
-          contentBlocks.push({ type: "text", text: "" });
-        } else if (event.content_block.type === "tool_use") {
-          currentBlockType = "tool_use";
-          currentToolId = event.content_block.id;
-          currentToolName = event.content_block.name;
-          currentToolInput = "";
-        }
-        break;
-
-      case "content_block_delta":
-        if (event.delta.type === "text_delta") {
-          const block = contentBlocks[currentTextIndex];
-          if (block && block.type === "text") {
-            block.text += event.delta.text;
+        case "content_block_start":
+          if (event.content_block.type === "text") {
+            currentBlockType = "text";
+            currentTextIndex = contentBlocks.length;
+            contentBlocks.push({ type: "text", text: "" });
+          } else if (event.content_block.type === "tool_use") {
+            currentBlockType = "tool_use";
+            currentToolId = event.content_block.id;
+            currentToolName = event.content_block.name;
+            currentToolInput = "";
           }
-          // stream the text directly
-          if (!silent) {
-            process.stdout.write(event.delta.text);
-          }
-        } else if (event.delta.type === "input_json_delta") {
-          currentToolInput += event.delta.partial_json;
-        }
-        break;
+          break;
 
-      case "content_block_stop":
-        if (currentBlockType === "tool_use") {
-          try {
-            contentBlocks.push({
-              type: "tool_use",
-              id: currentToolId,
-              name: currentToolName,
-              input: currentToolInput ? JSON.parse(currentToolInput) : {},
-            });
-          } catch {
-            contentBlocks.push({
-              type: "tool_use",
-              id: currentToolId,
-              name: currentToolName,
-              input: {},
-            });
+        case "content_block_delta":
+          if (event.delta.type === "text_delta") {
+            const block = contentBlocks[currentTextIndex];
+            if (block && block.type === "text") {
+              block.text += event.delta.text;
+            }
+            // stream the text directly
+            if (!silent) {
+              process.stdout.write(event.delta.text);
+            }
+          } else if (event.delta.type === "input_json_delta") {
+            currentToolInput += event.delta.partial_json;
           }
-          currentToolInput = "";
+          break;
 
-          // you can execute the tool here during mid-stream
-          // but it's different story
-        }
-        currentBlockType = null;
-        break;
+        case "content_block_stop":
+          if (currentBlockType === "tool_use") {
+            try {
+              contentBlocks.push({
+                type: "tool_use",
+                id: currentToolId,
+                name: currentToolName,
+                input: currentToolInput ? JSON.parse(currentToolInput) : {},
+              });
+            } catch {
+              contentBlocks.push({
+                type: "tool_use",
+                id: currentToolId,
+                name: currentToolName,
+                input: {},
+              });
+            }
+            currentToolInput = "";
+
+            // you can execute the tool here during mid-stream
+            // but it's different story
+          }
+          currentBlockType = null;
+          break;
+      }
     }
+  } catch (error) {
+    if (!silent) {
+      process.stdout.write("\n");
+      logger.warn(`Stream interrupted: ${(error as Error).message}`);
+    }
+
+    return { contentBlocks, usage };
   }
 
   if (!silent) process.stdout.write("\n");
-
   return { contentBlocks, usage };
 }
 
@@ -1882,8 +1978,12 @@ async function main() {
       });
       console.log();
     } catch (error) {
-      logger.error("An error occurred: " + (error as Error).message);
-      console.error(error);
+      const classifiedError = classifyError(error);
+      logger.error(classifiedError.message);
+
+      if (classifiedError.kind === "unknown") {
+        console.error(error);
+      }
     }
   }
 }
