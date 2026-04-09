@@ -4,7 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { Stream } from "@anthropic-ai/sdk/streaming";
 import { input, select } from "@inquirer/prompts";
 import { randomUUID } from "crypto";
-import fg, { stream } from "fast-glob";
+import fg from "fast-glob";
 import { createReadStream } from "fs";
 import fs from "fs/promises";
 import { LRUCache } from "lru-cache";
@@ -17,7 +17,6 @@ import { createInterface } from "readline";
 import TurndownService from "turndown";
 import z from "zod";
 
-const client = new Anthropic();
 const turndown = new TurndownService();
 
 /**
@@ -27,57 +26,36 @@ const turndown = new TurndownService();
 const MAX_TURNS = 20;
 const MAX_MATCHES = 50;
 const MAX_LINE_LENGTH = 500;
-const MAX_RESULT_CHARS = 10_000;
+const MAX_RESULT_CHARS = 4_000;
 const KEEP_RECENT_RESULTS = 6;
 const KEEP_RECENT_MESSAGES = 4;
-const COMPACT_THRESHOLD_TOKENS = 8_000;
+const COMPACT_THRESHOLD_TOKENS = 6_000;
 const MAX_CONTENT_LENGTH = 100_000;
 const WEB_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min
 const WEB_CACHE_MAX_ENTRIES = 100;
 const WEB_CACHE_MAX_SIZE_BYTES = 50 * 1024 * 1024; // 50 mb
 const CONFIG_DIR = path.join(homedir(), ".tiny-agent");
 const PROJECTS_DIR = path.join(CONFIG_DIR, "projects");
+const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 
-const OUTPUT_PROMPT = `# Output format
+const OUTPUT_PROMPT = `# Output
 
-  You are running in a terminal that does not render markdown. Do not use markdown formatting:
-  - No **bold** or *italic*
-  - No # headers
-  - No \`\`\`code blocks (just indent code with 2 spaces)
-  - No tables
-  - Use plain text with simple indentation and dashes for lists.`;
+  You are running in a terminal that does not render markdown:
+  - Be terse. Skip preamble and postamble.
+  - Don't restate the task.
+  - No markdown.
+  - If the tool result answers the question, just summarize it. Don't narrate every step.`;
 
-const SYSTEM_PROMPT = `You are a coding assistant that helps users with software engineering tasks. You have access to tools for reading, searching,
-  editing files, and running commands.
+const SYSTEM_PROMPT = `You are a coding assistant. Use tools to read, search, edit files and run commands.
 
-  # Tool efficiency
+  Rules:
+  - Read files before editing them
+  - Include enough context in old_string to make it unique
+  - Batch independent tool calls in parallel
+  - Be concise. Don't explain what you just did.
 
-  - When you need to run multiple independent tool calls, make them IN PARALLEL in a single response.
-  - For example, if you need to read 3 files, call read_file 3 times in one message, not across 3 turns.
-  - This is much faster for the user. Only use sequential calls when one tool's result is needed to decide the next call.
-
-  # How to work
-
-  - When given a task, start by understanding the codebase. Use list_files and search_files to find relevant files before making changes.
-  - Always read a file before editing it. Never guess what is in a file.
-  - Use search_files to find code patterns, function definitions, and usage across the project.
-  - When you find multiple candidate files, read them to understand which one is relevant.
-
-  # How to edit files
-
-  - Use the edit_file tool for modifications. Provide enough context in old_string to make the match unique.
-  - For new files, use write_file.
-  - After making edits, verify your changes make sense in context.
-
-  # How to handle ambiguity
-
-  - If the user's request is ambiguous, ask which one they mean.
-  - If you are unsure about the right approach, explain your plan before making changes.
-
-  # Communication
-
-  - Be concise. Show what you changed, not everything you considered.
-  - When reporting edits, mention the file path and what was changed.
+  # Using web_search
+  - When searching for current events, sports standings, news, or anything time-sensitive, include the current year in your query.
   
   ${OUTPUT_PROMPT}`;
 
@@ -124,6 +102,10 @@ const PLAN_MODE_INSTRUCTION = `
  * Type definitions
  */
 
+type Config = {
+  apiKey?: string;
+};
+
 type PermissionDecision = "allow" | "ask" | "deny";
 
 type Tool<T extends z.ZodObject<any> = z.ZodObject<any>> = {
@@ -149,6 +131,8 @@ type Session = {
   planMode: boolean;
   sessionId: string;
   sessionPath: string;
+  client: Anthropic;
+  showUsage: boolean;
 };
 
 type AgentLoopConfig = {
@@ -159,6 +143,11 @@ type AgentLoopConfig = {
   label: string;
   maxTurns?: number;
   silent?: boolean;
+};
+
+type StreamResult = {
+  contentBlocks: Anthropic.ContentBlockParam[];
+  usage: Anthropic.Usage | null;
 };
 
 type TranscriptEntry = {
@@ -179,7 +168,7 @@ const webFetchCache = new LRUCache<string, string>({
   ttl: WEB_CACHE_TTL_MS,
 });
 
-function createSession(): Session {
+function createSession(apiKey: string): Session {
   const sessionId = randomUUID();
   const sessionPath = path.join(getProjectDir(), `${sessionId}.jsonl`);
 
@@ -190,6 +179,8 @@ function createSession(): Session {
     planMode: false,
     sessionId,
     sessionPath,
+    client: new Anthropic({ apiKey }),
+    showUsage: true,
   };
 }
 
@@ -211,8 +202,80 @@ const logger = {
  * Helper functions
  */
 
+async function loadConfig(): Promise<Config> {
+  try {
+    const content = await fs.readFile(CONFIG_FILE, "utf-8");
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
+}
+
+async function saveConfig(config: Config): Promise<void> {
+  await fs.mkdir(path.dirname(CONFIG_FILE), { recursive: true });
+  await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2), {
+    mode: 0o600,
+  });
+}
+
+async function resolveApiKey(): Promise<string | undefined> {
+  if (process.env.ANTHROPIC_API_KEY) {
+    return process.env.ANTHROPIC_API_KEY;
+  }
+
+  const config = await loadConfig();
+
+  return config.apiKey;
+}
+
+async function validateApiKey(
+  apiKey: string,
+): Promise<{ valid: boolean; reason?: string }> {
+  try {
+    const client = new Anthropic({ apiKey });
+    await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    return { valid: true };
+  } catch (error: any) {
+    if (error.status === 401) {
+      return { valid: false, reason: "Invalid API key" };
+    }
+    if (error.status === 403) {
+      return { valid: false, reason: "Key has no permission for this model" };
+    }
+    if (error.status === 429) {
+      return {
+        valid: false,
+        reason: "Rate limited (key is valid but throttled)",
+      };
+    }
+    if (error.code === "ENOTFOUND" || error.code === "ECONNREFUSED") {
+      return { valid: false, reason: "Network error — check your connection" };
+    }
+    return { valid: false, reason: error.message ?? "Unknown error" };
+  }
+}
+
+function resolveSafePath(inputPath: string): string | null {
+  const expanded = inputPath.startsWith("~")
+    ? path.join(homedir(), inputPath.slice(1))
+    : inputPath;
+
+  const resolved = path.resolve(expanded);
+  const cwd = process.cwd();
+
+  if (resolved !== cwd && !resolved.startsWith(cwd + path.sep)) {
+    return null;
+  }
+
+  return resolved;
+}
+
 function sanitizeCwd(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9]/g, "");
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 function getProjectDir() {
@@ -223,10 +286,26 @@ async function appendSessionEntry(
   sessionPath: string,
   entry: TranscriptEntry,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+  await fs.mkdir(path.dirname(sessionPath), { recursive: true, mode: 0o700 });
 
   const line = JSON.stringify(entry) + "\n";
-  await fs.appendFile(sessionPath, line, "utf-8");
+  await fs.appendFile(sessionPath, line, {
+    encoding: "utf-8",
+    mode: 0o600,
+  });
+}
+
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      const isRetryable = error?.status === 429 || error?.status === 529;
+      if (!isRetryable || i === attempts - 1) throw error;
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** i));
+    }
+  }
+  throw new Error("unreachable");
 }
 
 function normalizeQuotes(str: string): string {
@@ -334,6 +413,7 @@ function clearOldToolResults(
 async function compactConversation(
   conversation: Anthropic.MessageParam[],
   tokenEstimation: number,
+  session: Session,
 ): Promise<{
   conversation: Anthropic.MessageParam[];
   wasCompacted: boolean;
@@ -345,8 +425,8 @@ async function compactConversation(
     };
   }
 
-  const summaryResponse = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+  const summaryResponse = await session.client.messages.create({
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 1024,
     system: COMPACT_SYSTEM_PROMPT,
     messages: conversation,
@@ -513,6 +593,31 @@ async function loadSession(
   return messages;
 }
 
+function formatUsage(usage: Anthropic.Usage): string {
+  const fmt = (n: number): string => {
+    if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+    return n.toString();
+  };
+
+  const parts = [
+    `${fmt(usage.input_tokens)} in`,
+    `${fmt(usage.output_tokens)} out`,
+  ];
+
+  if (usage.cache_read_input_tokens && usage.cache_read_input_tokens > 0) {
+    parts.push(`${fmt(usage.cache_read_input_tokens)} cached`);
+  }
+
+  if (
+    usage.cache_creation_input_tokens &&
+    usage.cache_creation_input_tokens > 0
+  ) {
+    parts.push(`${fmt(usage.cache_creation_input_tokens)} cache write`);
+  }
+
+  return parts.join(", ");
+}
+
 /**
  * Tool definitions and implementations
  */
@@ -541,9 +646,16 @@ const readFileTool: Tool = createTool({
   isConcurrencySafe: true,
   async call(input, session) {
     const { file_path } = input;
+
+    const safePath = resolveSafePath(file_path);
+
+    if (!safePath) {
+      return `Error: path is outside the project directory: ${file_path}`;
+    }
+
     try {
-      const fileContents = await fs.readFile(file_path, "utf-8");
-      session.readTimestamps.set(path.resolve(file_path), Date.now());
+      const fileContents = await fs.readFile(safePath, "utf-8");
+      session.readTimestamps.set(safePath, Date.now());
 
       return fileContents
         .split("\n")
@@ -561,11 +673,9 @@ const readFileTool: Tool = createTool({
 const editFileTool: Tool = createTool({
   name: "edit_file",
   description:
-    "Edit a file by replacing old_string with new_string. " +
-    "The old_string must appear exactly once in the file (unless replace_all is true). " +
-    "Include enough surrounding context to make the match unique.",
+    "Replace old_string with new_string in a file. old_string must be unique unless replace_all is true.",
   inputSchema: z.object({
-    file_path: z.string().describe("The path to the file to edit"),
+    file_path: z.string().describe("File path"),
     old_string: z.string().describe("The exact string to find"),
     new_string: z
       .string()
@@ -580,52 +690,51 @@ const editFileTool: Tool = createTool({
   async call(input, session) {
     const { file_path, old_string, new_string, replace_all = false } = input;
 
+    const safePath = resolveSafePath(file_path);
+    if (!safePath) {
+      return `Error: path is outside the project directory: ${file_path}`;
+    }
+
     if (old_string === new_string) {
       return "Error: old_string and new_string must be different.";
     }
 
-    if (!(await fs.exists(file_path))) {
-      return `Error: File not found: ${file_path}`;
-    }
+    try {
+      const content = await fs.readFile(safePath, "utf-8");
+      const normalizedOldString = findNormalizedString(content, old_string);
 
-    const content = await fs.readFile(file_path, "utf-8");
-    const normalizedOldString = findNormalizedString(content, old_string);
-
-    if (!normalizedOldString) {
-      return `Error: old_string not found in file: ${old_string}`;
-    }
-
-    if (!replace_all) {
-      const count = content.split(normalizedOldString).length - 1;
-
-      if (count > 1) {
-        return `Error: old_string appears ${count} times in the file. Include more surrounding context to make it unique, or set replace_all to true.`;
+      if (!normalizedOldString) {
+        return `Error: old_string not found in file: ${old_string}`;
       }
-    }
 
-    const resolvedFilePath = path.resolve(file_path);
-    const lastReadTimestamp = session.readTimestamps.get(resolvedFilePath);
-
-    if (lastReadTimestamp) {
-      try {
-        const stat = await fs.stat(file_path);
-
-        if (stat.mtimeMs > lastReadTimestamp) {
-          return `Error: The file has been modified since it was last read. Please read the file again to get the latest contents before editing.`;
+      if (!replace_all) {
+        const count = content.split(normalizedOldString).length - 1;
+        if (count > 1) {
+          return `Error: old_string appears ${count} times in the file. Include more surrounding context to make it unique, or set replace_all to true.`;
         }
-      } catch {
-        return `Error: Unable to access file metadata for: ${file_path}`;
       }
+
+      const lastReadTimestamp = session.readTimestamps.get(safePath);
+      if (!lastReadTimestamp) {
+        return "Error: file must be read before editing. Use read_file first.";
+      }
+
+      const stat = await fs.stat(safePath);
+      if (stat.mtimeMs > lastReadTimestamp) {
+        return "Error: The file has been modified since it was last read. Please read the file again to get the latest contents before editing.";
+      }
+
+      const updated = replace_all
+        ? content.split(normalizedOldString).join(new_string)
+        : content.replace(normalizedOldString, new_string);
+      await fs.writeFile(safePath, updated, "utf-8");
+
+      session.readTimestamps.set(safePath, Date.now());
+
+      return `File edited: ${safePath}`;
+    } catch (error) {
+      return `Error editing file: ${(error as Error).message}`;
     }
-
-    const updated = replace_all
-      ? content.split(normalizedOldString).join(new_string)
-      : content.replace(normalizedOldString, new_string);
-    await fs.writeFile(file_path, updated, "utf-8");
-
-    session.readTimestamps.set(resolvedFilePath, Date.now());
-
-    return `File edited: ${file_path}`;
   },
   checkPermissions() {
     return "ask";
@@ -643,10 +752,16 @@ const writeFileTool: Tool = createTool({
   async call(input) {
     const { file_path, contents } = input;
 
+    const safePath = resolveSafePath(file_path);
+
+    if (!safePath) {
+      return `Error: path is outside the project directory: ${file_path}`;
+    }
+
     try {
-      await fs.mkdir(path.dirname(file_path), { recursive: true });
-      await fs.writeFile(file_path, contents, "utf-8");
-      return `File written: ${file_path}`;
+      await fs.mkdir(path.dirname(safePath), { recursive: true });
+      await fs.writeFile(safePath, contents, "utf-8");
+      return `File written: ${safePath}`;
     } catch (error) {
       return `Error writing file: ${(error as Error).message}`;
     }
@@ -673,18 +788,21 @@ const globTool: Tool = createTool({
   async call(input) {
     const { directory = process.cwd(), pattern = "**/*" } = input;
 
-    const searchDir = path.isAbsolute(directory)
-      ? directory
-      : path.resolve(directory);
-    const stat = await fs.stat(searchDir);
+    const safePath = resolveSafePath(directory);
 
-    if (!stat.isDirectory()) {
-      return `Directory not found: ${directory}`;
+    if (!safePath) {
+      return `Error: path is outside the project directory: ${directory}`;
     }
 
     try {
+      const stat = await fs.stat(safePath);
+
+      if (!stat.isDirectory()) {
+        return `Not a directory: ${safePath}`;
+      }
+
       const entries = await fg(pattern, {
-        cwd: searchDir,
+        cwd: safePath,
         absolute: true,
         dot: true,
         onlyFiles: true,
@@ -724,69 +842,81 @@ const grepTool: Tool = createTool({
   async call(input) {
     const { directory = process.cwd(), pattern } = input;
 
-    const re = new RE2(pattern, "u");
+    const safePath = resolveSafePath(directory);
 
-    const searchDir = path.isAbsolute(directory)
-      ? directory
-      : path.resolve(directory);
+    if (!safePath) {
+      return `Error: path is outside the project directory: ${directory}`;
+    }
 
-    const files = await fg("**/*", {
-      cwd: searchDir,
-      absolute: true,
-      dot: true,
-      onlyFiles: true,
-      followSymbolicLinks: false,
-      // you can grow the list
-      ignore: [
-        "**/*.png",
-        "**/*.jpg",
-        "**/*.jpeg",
-        "**/*.gif",
-        "**/*.bmp",
-        "**/*.pdf",
-        "**/*.zip",
-        "**/*.tar",
-        "**/*.gz",
-        "**/*.7z",
-        "**/*.exe",
-        "**/*.bin",
-      ],
-    });
+    try {
+      const stat = await fs.stat(safePath);
 
-    const matches: { file: string; line: number; content: string }[] = [];
-
-    for (const file of files) {
-      try {
-        const contents = await fs.readFile(file, "utf-8");
-        const lines = contents.split("\n");
-
-        lines.forEach((line, index) => {
-          if (re.test(line)) {
-            matches.push({
-              file,
-              line: index + 1,
-              content: line.trim().slice(0, MAX_LINE_LENGTH),
-            });
-          }
-        });
-      } catch {
-        continue;
+      if (!stat.isDirectory()) {
+        return `Not a directory: ${safePath}`;
       }
-    }
 
-    if (matches.length === 0) {
-      return `No matches found for pattern: ${pattern}`;
-    }
+      const re = new RE2(pattern, "u");
 
-    return (
-      matches
-        .slice(0, MAX_MATCHES)
-        .map((match) => `${match.file}:${match.line}:${match.content}`)
-        .join("\n") +
-      (matches.length > MAX_MATCHES
-        ? `\n...and ${matches.length - MAX_MATCHES} more matches`
-        : "")
-    );
+      const files = await fg("**/*", {
+        cwd: safePath,
+        absolute: true,
+        dot: true,
+        onlyFiles: true,
+        followSymbolicLinks: false,
+        // you can grow the list
+        ignore: [
+          "**/*.png",
+          "**/*.jpg",
+          "**/*.jpeg",
+          "**/*.gif",
+          "**/*.bmp",
+          "**/*.pdf",
+          "**/*.zip",
+          "**/*.tar",
+          "**/*.gz",
+          "**/*.7z",
+          "**/*.exe",
+          "**/*.bin",
+        ],
+      });
+
+      const matches: { file: string; line: number; content: string }[] = [];
+
+      for (const file of files) {
+        try {
+          const contents = await fs.readFile(file, "utf-8");
+          const lines = contents.split("\n");
+
+          lines.forEach((line, index) => {
+            if (re.test(line)) {
+              matches.push({
+                file,
+                line: index + 1,
+                content: line.trim().slice(0, MAX_LINE_LENGTH),
+              });
+            }
+          });
+        } catch {
+          continue;
+        }
+      }
+
+      if (matches.length === 0) {
+        return `No matches found for pattern: ${pattern}`;
+      }
+
+      return (
+        matches
+          .slice(0, MAX_MATCHES)
+          .map((match) => `${match.file}:${match.line}:${match.content}`)
+          .join("\n") +
+        (matches.length > MAX_MATCHES
+          ? `\n...and ${matches.length - MAX_MATCHES} more matches`
+          : "")
+      );
+    } catch (error) {
+      return `Error searching: ${(error as Error).message}`;
+    }
   },
   checkPermissions() {
     return "allow";
@@ -834,11 +964,16 @@ const shellTool: Tool = createTool({
   checkPermissions(input) {
     const { command } = input;
 
-    if (/^(ls|cat|echo|pwd|git\s+(status|diff|log))/.test(command)) {
-      return "allow" as const;
-    }
+    if (/[;&|`$()<>\\]/.test(command)) return "ask";
 
-    return "ask";
+    const safePatterns = [
+      /^ls( -[la1-9]+)?( \.?[\w./-]*)?$/,
+      /^pwd$/,
+      /^echo .{1,100}$/,
+      /^cat [\w./-]+$/,
+      /^git (status|diff|log)( [\w./-]+)?$/,
+    ];
+    return safePatterns.some((p) => p.test(command)) ? "allow" : "ask";
   },
 });
 
@@ -928,7 +1063,6 @@ const exitPlanModeTool: Tool = createTool({
     }
 
     if (choice === "cancel") {
-      session.planMode = false;
       return "User cancelled. Stop and wait for further instructions.";
     }
 
@@ -948,11 +1082,11 @@ const webSearchTool: Tool = createTool({
     query: z.string().describe("The search query"),
   }),
   isConcurrencySafe: true,
-  async call(input) {
+  async call(input, session) {
     const { query } = input;
 
     try {
-      const response = await client.messages.create({
+      const response = await session.client.messages.create({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 2048,
         tools: [
@@ -963,6 +1097,7 @@ const webSearchTool: Tool = createTool({
           } as any,
         ],
         tool_choice: { type: "tool", name: "web_search" },
+        system: `Today's date is ${new Date().toISOString().split("T")[0]}. Use the current year in searches when relevant.`,
         messages: [
           {
             role: "user",
@@ -1003,7 +1138,7 @@ const webFetchTool: Tool = createTool({
       ),
   }),
   isConcurrencySafe: true,
-  async call(input) {
+  async call(input, session) {
     const { url, prompt } = input;
     const cacheKey = `${url}::${prompt}`;
 
@@ -1015,6 +1150,22 @@ const webFetchTool: Tool = createTool({
 
     try {
       const parsed = new URL(url);
+      const hostname = parsed.hostname;
+
+      if (
+        hostname === "localhost" ||
+        hostname.startsWith("127.") ||
+        hostname.startsWith("10.") ||
+        hostname.startsWith("192.168.") ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+        hostname === "169.254.169.254"
+      ) {
+        return "Error: cannot fetch private or local IPs.";
+      }
+
+      if (parsed.username || parsed.password) {
+        return "Error: URLs with credentials are not allowed.";
+      }
 
       if (!["http:", "https:"].includes(parsed.protocol)) {
         return "Error: Only http:// and https:// URLs are supported.";
@@ -1043,7 +1194,7 @@ const webFetchTool: Tool = createTool({
         content = content.slice(0, MAX_CONTENT_LENGTH) + "\n\n[truncated]";
       }
 
-      const modelResponse = await client.messages.create({
+      const modelResponse = await session.client.messages.create({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 2048,
         messages: [
@@ -1098,18 +1249,44 @@ const tools: Tool[] = [
 async function streamResponse(
   response: Stream<Anthropic.MessageStreamEvent>,
   silent = false,
-): Promise<Anthropic.ContentBlockParam[]> {
+): Promise<StreamResult> {
   const contentBlocks: Anthropic.ContentBlockParam[] = [];
+  let usage: Anthropic.Usage | null = null;
 
   let currentBlockType: string | null = null;
   let currentToolInput = "";
   let currentToolId = "";
   let currentToolName = "";
   let currentTextIndex = -1;
-  let didWrite = false;
 
   for await (const event of response) {
     switch (event.type) {
+      case "message_start":
+        if (event.message.usage) {
+          usage = {
+            ...event.message.usage,
+          };
+        }
+        break;
+
+      case "message_delta":
+        if (event.usage && usage) {
+          if (typeof event.usage.output_tokens === "number") {
+            usage.output_tokens = event.usage.output_tokens;
+          }
+          if (typeof event.usage.input_tokens === "number") {
+            usage.input_tokens = event.usage.input_tokens;
+          }
+          if (typeof event.usage.cache_read_input_tokens === "number") {
+            usage.cache_read_input_tokens = event.usage.cache_read_input_tokens;
+          }
+          if (typeof event.usage.cache_creation_input_tokens === "number") {
+            usage.cache_creation_input_tokens =
+              event.usage.cache_creation_input_tokens;
+          }
+        }
+        break;
+
       case "content_block_start":
         if (event.content_block.type === "text") {
           currentBlockType = "text";
@@ -1132,7 +1309,6 @@ async function streamResponse(
           // stream the text directly
           if (!silent) {
             process.stdout.write(event.delta.text);
-            didWrite = true;
           }
         } else if (event.delta.type === "input_json_delta") {
           currentToolInput += event.delta.partial_json;
@@ -1166,9 +1342,9 @@ async function streamResponse(
     }
   }
 
-  if (didWrite) process.stdout.write("\n");
+  if (!silent) process.stdout.write("\n");
 
-  return contentBlocks;
+  return { contentBlocks, usage };
 }
 
 /**
@@ -1250,7 +1426,7 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
     let compressed = clearOldToolResults(conversation);
     const tokenEstimation = estimateTokens(compressed);
     const { conversation: compactedConversation, wasCompacted } =
-      await compactConversation(compressed, tokenEstimation);
+      await compactConversation(compressed, tokenEstimation, session);
 
     if (wasCompacted) {
       if (!silent) spinner.stop();
@@ -1260,14 +1436,27 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
       if (!silent) spinner.start("Cooking...");
     }
 
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4096,
-      messages: compactedConversation,
-      tools: toolsJson,
-      system: `${systemPrompt}\n\nToday's date is ${new Date().toISOString().split("T")[0]}`,
-      stream: true,
-    });
+    const response = await withRetry(() =>
+      session.client.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4096,
+        messages: compactedConversation,
+        tools: toolsJson.map((tool, i) => ({
+          ...tool,
+          ...(i === toolsJson.length - 1
+            ? { cache_control: { type: "ephemeral" as const } }
+            : {}),
+        })),
+        system: [
+          {
+            type: "text",
+            text: `${systemPrompt}\n\nToday: ${new Date().toISOString().split("T")[0]}. Cwd: ${process.cwd()}.`,
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        stream: true,
+      }),
+    );
 
     // Print agent label, then stream tokens directly under it
     if (!silent) {
@@ -1275,15 +1464,17 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
       process.stdout.write(pc.bold(pc.cyan(`${label}: `)));
     }
 
-    const contentBlocks: Anthropic.ContentBlockParam[] = await streamResponse(
-      response,
-      silent,
-    );
+    const { contentBlocks, usage } = await streamResponse(response, silent);
 
     conversation.push({
       role: "assistant",
       content: contentBlocks,
     });
+
+    if (!silent && usage && session.showUsage) {
+      console.log();
+      logger.dim(`└ ${formatUsage(usage)}`);
+    }
 
     await appendSessionEntry(session.sessionPath, {
       type: "assistant",
@@ -1476,11 +1667,71 @@ async function agentLoop(config: AgentLoopConfig): Promise<string> {
 }
 
 /**
+ * Onboarding
+ */
+
+async function onboarding(): Promise<string> {
+  console.log();
+  console.log(pc.bold(pc.cyan("Welcome to Tiny Agent!")));
+  console.log(pc.dim("Let's set up your Anthropic API key."));
+  console.log(pc.dim("Get one at https://console.anthropic.com/settings/keys"));
+  console.log();
+
+  while (true) {
+    let apiKey: string;
+    try {
+      apiKey = await input({
+        message: "API key",
+        theme: {
+          style: {
+            answer: (text: string) => pc.white(text),
+          },
+        },
+        validate: (value) => {
+          if (!value.trim()) return "API key is required";
+          if (!value.startsWith("sk-ant-")) {
+            return "Invalid API key format (should start with 'sk-ant-')";
+          }
+          return true;
+        },
+      });
+    } catch {
+      console.log();
+      logger.dim("Cancelled.");
+      process.exit(0);
+    }
+
+    const spinner = ora({
+      text: "Validating API key...",
+      color: "cyan",
+    }).start();
+    const result = await validateApiKey(apiKey.trim());
+    spinner.stop();
+
+    if (result.valid) {
+      await saveConfig({ apiKey: apiKey.trim() });
+      logger.success(`API key validated and saved to ${CONFIG_FILE}`);
+      console.log();
+      return apiKey.trim();
+    }
+
+    logger.error(`Validation failed: ${result.reason}`);
+    console.log();
+  }
+}
+
+/**
  * Main entry
  */
 
 async function main() {
-  const session = createSession();
+  let apiKey = await resolveApiKey();
+
+  if (!apiKey) {
+    apiKey = await onboarding();
+  }
+
+  const session = createSession(apiKey);
   const conversation: Anthropic.MessageParam[] = [];
 
   console.log();
@@ -1521,11 +1772,29 @@ async function main() {
               : "Plan mode disabled.",
           );
           continue; // skip agent loop, go back to prompt
-        case "/resume":
+
+        case "/login": {
+          const newKey = await onboarding();
+          session.client = new Anthropic({ apiKey: newKey });
+          logger.info("API key updated.");
+          console.log();
+          continue;
+        }
+
+        case "/logout":
+          await saveConfig({});
+          logger.info(
+            "API key cleared. Run `tiny-agent` again to log in with a new key.",
+          );
+          console.log();
+          process.exit(0);
+
+        case "/resume": {
           const sessions = await listSessions();
 
           if (sessions.length === 0) {
             logger.warn("No previous sessions found for this directory.");
+            continue;
           }
 
           let choice: string;
@@ -1547,11 +1816,14 @@ async function main() {
           conversation.push(...loadedSession);
 
           session.sessionPath = choice;
+          session.sessionId = path.basename(choice, ".jsonl");
 
           logger.info(`Resumed ${loadedSession.length} messages.`);
 
           continue;
-        case "/clear":
+        }
+
+        case "/clear": {
           conversation.length = 0;
 
           const newSessionId = randomUUID();
@@ -1565,6 +1837,19 @@ async function main() {
           logger.dim("Conversation cleared.");
           console.log();
           continue;
+        }
+
+        case "/usage":
+          session.showUsage = !session.showUsage;
+          logger.info(`Usage display ${session.showUsage ? "on" : "off"}`);
+          continue;
+
+        case "/tokens": {
+          const estimate = estimateTokens(conversation);
+          logger.info(`Estimated tokens: ${estimate}`);
+          continue;
+        }
+
         default:
           logger.warn(`Unknown command: ${cmd}`);
           continue;

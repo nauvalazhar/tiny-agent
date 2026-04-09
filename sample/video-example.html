@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ビデオサンプル</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        video {
+            width: 100%;
+            max-width: 600px;
+            height: auto;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .video-container {
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>HTML Video Examples</h1>
+    
+    <h2>Basic Video with Controls</h2>
+    <div class="video-container">
+        <video controls>
+            <source src="sample-video.mp4" type="video/mp4">
+            <source src="sample-video.webm" type="video/webm">
+            Your browser does not support the video tag.
+        </video>
+    </div>
+
+    <h2>Video with Autoplay (Muted)</h2>
+    <div class="video-container">
+        <video controls autoplay muted loop>
+            <source src="sample-video.mp4" type="video/mp4">
+            <source src="sample-video.webm" type="video/webm">
+            Your browser does not support the video tag.
+        </video>
+    </div>
+
+    <h2>Video with Poster Image</h2>
+    <div class="video-container">
+        <video controls poster="video-thumbnail.jpg">
+            <source src="sample-video.mp4" type="video/mp4">
+            <source src="sample-video.webm" type="video/webm">
+            Your browser does not support the video tag.
+        </video>
+    </div>
+
+    <h2>YouTube Embed Alternative</h2>
+    <div class="video-container">
+        <iframe width="560" height="315" 
+                src="https://www.youtube.com/embed/dQw4w9WgXcQ" 
+                title="YouTube video player" 
+                frameborder="0" 
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                allowfullscreen>
+        </iframe>
+    </div>
+
+    <h2>Basic HTML Structure</h2>
+    <p>The basic video element structure:</p>
+    <pre><code>&lt;video controls&gt;
+    &lt;source src="video.mp4" type="video/mp4"&gt;
+    &lt;source src="video.webm" type="video/webm"&gt;
+    Your browser does not support the video tag.
+&lt;/video&gt;</code></pre>
+
+    <h3>Common Attributes:</h3>
+    <ul>
+        <li><strong>controls</strong> - Shows play/pause and other controls</li>
+        <li><strong>autoplay</strong> - Starts playing automatically (usually requires muted)</li>
+        <li><strong>muted</strong> - Starts muted (required for autoplay in most browsers)</li>
+        <li><strong>loop</strong> - Repeats the video when it ends</li>
+        <li><strong>poster</strong> - Image to show before video starts</li>
+        <li><strong>width/height</strong> - Set dimensions</li>
+    </ul>
+
+</body>
+</html>
