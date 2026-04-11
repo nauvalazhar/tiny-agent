@@ -4,6 +4,11 @@ A coding agent CLI built from scratch in a single TypeScript file. It can read, 
 
 This started as a learning project to understand how tools like Claude Code, Cursor, and Aider work under the hood. Turns out the core is simpler than you'd think.
 
+<div align="center">
+<img width="764" height="548" alt="image" src="https://github.com/user-attachments/assets/3e17e53b-d0a9-4d76-a6ab-59dd3e49b83d" />
+</div>
+
+
 ## How it works
 
 The whole thing is a `while(true)` loop:
