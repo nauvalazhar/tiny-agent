@@ -1,5 +1,10 @@
 #!/usr/bin/env bun
 
+/**
+ * tiny-agent: a minimalist AI agentic coding
+ * This script demonstrate the core loop of an AI agent
+ */
+
 import Anthropic from "@anthropic-ai/sdk";
 import type { Stream } from "@anthropic-ai/sdk/streaming";
 import { input, select } from "@inquirer/prompts";
@@ -20,7 +25,9 @@ import z from "zod";
 const turndown = new TurndownService();
 
 /**
- * Constants
+ * Configuration
+ * We set strict bounds to prevent the agent from infinite loop
+ * or burning through your API credits.
  */
 
 const MAX_TURNS = 20;
